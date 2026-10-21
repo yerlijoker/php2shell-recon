@@ -53,7 +53,3 @@ allow them. Use `--jsonl-append` to resume and append to an existing JSONL
 file. `--rate` limits requests per second per host, `--retries` retries failed
 network requests, and `--proxy` routes regular HTTP requests through a proxy.
 
-## License
-
-This project is licensed under the MIT License. Before publishing, replace
-`[YOUR NAME OR GITHUB USERNAME]` in `LICENSE` with your name or GitHub username.
