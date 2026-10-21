@@ -16,7 +16,6 @@ import asyncio
 import csv
 import datetime
 import json
-import math
 import os
 import random
 import re
@@ -24,12 +23,14 @@ import signal
 import sys
 import time
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Optional
+from typing import Any, Optional
 from urllib.parse import urlparse
 
-# uvloop integration (Linux/macOS)
+# uvloop integration (Linux/macOS - optional)
+_HAVE_UVLOOP = False
 try:
-    import uvloop
+    import importlib
+    uvloop = importlib.import_module('uvloop')
     asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
     _HAVE_UVLOOP = True
 except Exception:
@@ -49,10 +50,12 @@ except ImportError:  # fallback: httpx
         sys.stderr.write("pip install aiohttp   (veya)   pip install httpx\n")
         sys.exit(2)
 
+_HAVE_AIOHTTP_SOCKS = False
 try:
-    import aiohttp_socks
+    import importlib
+    aiohttp_socks = importlib.import_module('aiohttp_socks')
     _HAVE_AIOHTTP_SOCKS = True
-except ImportError:
+except Exception:
     _HAVE_AIOHTTP_SOCKS = False
 
 # ------------------------------------------------------------------ config & stealth
@@ -335,10 +338,11 @@ class HTTP:
         self._timeout_read = 15
         self.proxy_rotator = ProxyRotator(args.proxy, getattr(args, "proxy_file", None))
 
-        # Async DNS caching
+        # Async DNS caching (optional)
         self._resolver = None
         try:
-            import aiodns
+            import importlib
+            importlib.import_module('aiodns')
             self._resolver = aiohttp.AsyncResolver()
         except Exception:
             pass
