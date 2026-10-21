@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.env
+
+# Local inputs and scan results
+domains.txt
+results.jsonl
+*.jsonl
+*.csv
+green_targets.txt
+
+# Local tooling
+.idea/
+.vscode/
+*.log
