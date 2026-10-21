@@ -66,6 +66,3 @@ python scan.py --input domains.txt --out results.jsonl --summary summary.csv \
 - `--jsonl-append`: Resume and append to an existing JSONL output file.
 - `--include-http`: Allow explicit `http://` targets.
 
-## License
-
-This project is licensed under the MIT License.
