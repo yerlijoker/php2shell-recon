@@ -1,7 +1,14 @@
 # php2shell-recon
 
-A bulk target scanner for inspecting PHP configuration and version information
+A high-performance bulk target scanner for inspecting PHP configuration and version information
 as part of authorized security testing.
+
+## Features
+
+- **High Performance:** `uvloop` event-loop support on Linux/macOS, async DNS caching (`aiodns`), and connection pooling with keep-alive optimization.
+- **Stealth & Browser Emulation:** Realistic User-Agent pool, dynamic Client Hints (`Sec-Ch-Ua`), and HTTP header emulation.
+- **Proxy Rotation:** Single proxy (`--proxy`) or file-based proxy list rotation (`--proxy-file`) supporting HTTP, HTTPS, and SOCKS5.
+- **Advanced PHP Fingerprinting:** Passive header inspection, error status code disclosure analysis (404/405/413/500 address banners), PHP error path leak extraction, and SAPI heuristic classification (mod_php, fpm, litespeed, frankenphp).
 
 ## Warning
 
@@ -45,11 +52,20 @@ Then run:
 
 ```bash
 python scan.py --input domains.txt --out results.jsonl --summary summary.csv \
-  --probe-post-max --probe-memory
+  --random-ua --concurrency 30 --probe-post-max --probe-memory
 ```
 
-By default, explicit `http://` targets are skipped. Add `--include-http` to
-allow them. Use `--jsonl-append` to resume and append to an existing JSONL
-file. `--rate` limits requests per second per host, `--retries` retries failed
-network requests, and `--proxy` routes regular HTTP requests through a proxy.
+### Key Options
 
+- `--random-ua`: Enable randomized browser User-Agent and realistic headers.
+- `--proxy <url>`: Route requests through a single HTTP/SOCKS5 proxy.
+- `--proxy-file <path>`: Rotate requests across multiple proxies listed in a text file.
+- `--probe-error-page`: Actively probe non-existent PHP endpoints to capture error banners disclosing PHP/server details.
+- `--concurrency <N>`: Set max concurrent scanning tasks (default: 30).
+- `--rate <N>`: Limit requests per second per host (0 = unlimited).
+- `--jsonl-append`: Resume and append to an existing JSONL output file.
+- `--include-http`: Allow explicit `http://` targets.
+
+## License
+
+This project is licensed under the MIT License.

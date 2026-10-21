@@ -1,1 +1,4 @@
 aiohttp>=3.9,<4
+aiodns>=3.2.0; sys_platform != 'win32'
+aiohttp-socks>=0.8.4
+uvloop>=0.19.0; sys_platform != 'win32'
